@@ -6,6 +6,7 @@ start/hospital so every combination demos reliably.
 """
 import datetime as dt
 import math
+import random
 
 import folium
 import plotly.graph_objects as go
@@ -148,13 +149,14 @@ def clock(minutes):
 # ----------------------------------------------------------------------------- state
 S = st.session_state
 for k, v in dict(screen="overview", phase="idle", route="rel", hosp=None, hosp_manual=False, manual=MANUAL_DEFAULT,
-                 manual_last=None, idx=0, hold=0, nav=None, plan=None, history=[]).items():
+                 manual_last=None, idx=0, hold=0, nav=None, book=None, plan=None, history=[]).items():
     S.setdefault(k, v)
 
 
 def goto(screen):
     S.screen, S.phase, S.idx, S.hold = screen, "idle", 0, 0
     if screen != "arrival":
+        S.book = None
         S.nav = None
 
 
@@ -164,6 +166,8 @@ def start_pos():
 
 
 def begin_navigation(routes, etas, hosp, wide):
+    if (S.book or {}).get("stage") != "started":
+        return  # no navigation before OTP verification
     kind = S.route
     info = routes[kind]
     S.nav = dict(kind=kind, info=info, alt=make_alt(info["path"]), eta=etas[kind], etas=etas, hosp=hosp, wide=wide,
@@ -282,6 +286,8 @@ MAP_CSS = """<style>
 .me{width:16px;height:16px;border-radius:50%;background:#2563eb;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.35)}
 .inc{width:46px;height:46px;border-radius:50%;background:#ef4444;display:flex;align-items:center;justify-content:center;font-size:22px;border:3px solid #fff;animation:ring 1.4s infinite}
 @keyframes ring{70%{box-shadow:0 0 0 20px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+.otp{font:800 44px Manrope;letter-spacing:.5em;text-indent:.5em;text-align:center;background:#eff6ff;color:#1d4ed8;border:2px dashed #93c5fd;border-radius:16px;padding:16px 0;margin:12px 0}
+.steps{display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 16px}
 .legend{position:fixed;z-index:9999;background:rgba(255,255,255,.96);padding:8px 12px;border-radius:12px;font:700 11px 'DM Sans',sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.18);line-height:1.8}
 .legend b{display:inline-block;width:22px;height:4px;border-radius:3px;margin-right:6px;vertical-align:middle}
 </style>"""
@@ -289,7 +295,7 @@ MAP_CSS = """<style>
 
 def legend(pos):
     return (f'<div class="legend" style="{pos}"><b style="background:{BLUE}"></b>Fastest<br><b style="background:{GREEN}"></b>Reliable / new route<br>'
-            f'<b style="background:{AMBER}"></b>Original route<br><b style="background:{RED}"></b>Incident</div>')
+            f'<b style="background:{AMBER}"></b>Original route<br><b style="background:{RED}"></b>Busy road</div>')
 
 
 st.markdown(CSS, unsafe_allow_html=True)
@@ -343,7 +349,7 @@ def arrow(pos, b):
 
 
 def incident_pin(pos):
-    return folium.Marker(pos, tooltip="Road accident", icon=folium.DivIcon(html='<div class="inc">💥</div>', icon_size=(46, 46),
+    return folium.Marker(pos, tooltip="Road looks too busy", icon=folium.DivIcon(html='<div class="inc">💥</div>', icon_size=(46, 46),
                                                                            icon_anchor=(23, 23), class_name="pin-icon"))
 
 
@@ -372,9 +378,9 @@ def draw_map(key, items, center, zoom, height=560, click=False, leg="top:12px;ri
 NAV = [("overview", "Overview", ":material/home:"), ("hospitals", "Find a hospital", ":material/map:"),
        ("planner", "Trip planner", ":material/calendar_month:"), ("history", "Trip history", ":material/history:")]
 TITLES = {"overview": f"Good {'morning' if dt.datetime.now().hour < 12 else 'afternoon' if dt.datetime.now().hour < 17 else 'evening'}, Alex",
-          "hospitals": "Choose a hospital", "compare": "Compare routes", "navigation": "Live navigation", "arrival": "Arrival",
+          "hospitals": "Choose a hospital", "booking": "Book an ambulance", "compare": "Compare routes", "navigation": "Live navigation", "arrival": "Arrival",
           "planner": "Plan a non-urgent trip", "history": "Trip history"}
-active = "hospitals" if S.screen in ("hospitals", "compare", "navigation", "arrival") else S.screen
+active = "hospitals" if S.screen in ("hospitals", "booking", "compare", "navigation", "arrival") else S.screen
 with st.sidebar:
     st.markdown('<div class="logo"><div class="mark">E</div><div><div class="word">EMERGE</div>'
                 '<div class="wtag">Emergency Route Intelligence</div></div></div><p class="sbhead">Workspace</p>', unsafe_allow_html=True)
@@ -489,8 +495,8 @@ def hospitals():
         elif S.get("s_missing"):
             st.markdown('<div class="alert al-amber"><h3>Live traffic &amp; weather data unavailable</h3>'
                         '<p>Using historical averages. ETA confidence is <b>lower</b> than usual.</p></div>', unsafe_allow_html=True)
-        if st.button("Compare routes  →", type="primary", width="stretch", disabled=unreachable, key="to_compare"):
-            S.screen = "compare"
+        if st.button("Book ambulance  →", type="primary", width="stretch", disabled=unreachable, key="to_compare"):
+            S.screen = "booking"
             st.rerun()
     with right:
         items = [me_pin(start)] + [hospital_pin(h["pos"], n, n == hosp, n.split(",")[0].split(" (")[0]) for n, h in HOSPITALS.items()]
@@ -561,6 +567,91 @@ def compare():
     st.button("← Back to hospitals", key="back_h", on_click=goto, args=("hospitals",))
 
 
+# ----------------------------------------------------------------------------- ambulance booking (frontend simulation only)
+ARRIVE_S, START_S = 10, 3  # demo seconds: ambulance travel time, "Ride started" pause before route selection
+
+
+def quote():
+    r = random.Random(f"{hosp}{start}")  # stable across reruns
+    return dict(type="Advanced Life Support (ALS)", avail=r.randint(2, 5), pickup=r.randint(5, 9), journey=etas["rel"]["exp"],
+                cost=round((900 + 60 * routes["rel"]["cum"][-1]) / 10) * 10)
+
+
+def stepper(i):
+    names = ["Booked", "On the way", "Arrived", "Verified"]
+    return '<div class="steps">' + "".join(pill(n, "green" if j < i else "blue" if j == i else "amber") for j, n in enumerate(names)) + "</div>"
+
+
+def ambulance_card(b, status):
+    return (f'<div class="card"><div class="row sp" style="align-items:flex-start"><div class="row"><div class="ico b">{hsvg(20)}</div><div>'
+            f'<div class="ttl">{b["type"]}</div><div class="mut">Booking ID {b["id"]}</div></div></div>{pill(status)}</div>'
+            f'<div style="margin-top:16px">{mets([(b["reg"], "Registration", False), (b["driver"], "Driver", False), (b["phone"], "Contact", False), (f"{b["pickup"]} min", "Est. arrival", True)])}</div></div>')
+
+
+@st.fragment(run_every=1)
+def tracking():
+    b = S.book
+    el = (dt.datetime.now() - b["t0"]).total_seconds()
+    if el >= ARRIVE_S:
+        b["stage"] = "otp"
+        st.rerun()
+    left = max(1, math.ceil(b["pickup"] * (1 - el / ARRIVE_S)))
+    st.markdown(f'<div class="card"><div class="row sp"><div class="ttl">Ambulance heading to {start_label}</div><div class="mut">~{left} min away</div></div>'
+                f'<div class="prog" style="margin-top:14px"><i style="width:{min(el / ARRIVE_S, 1) * 100:.0f}%"></i></div></div>', unsafe_allow_html=True)
+
+
+@st.fragment(run_every=1)
+def ride_started():
+    if (dt.datetime.now() - S.book["t1"]).total_seconds() >= START_S:
+        S.screen = "compare"  # hand over to the existing route comparison -> navigation
+        st.rerun()
+    st.markdown(f'<div style="text-align:center;max-width:560px;margin:0 auto"><div class="done"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" '
+                f'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg></div>'
+                f'<p class="eyebrow" style="color:#059669;margin-top:22px">OTP verified</p><h1 style="font-size:2.2rem;font-weight:600;margin:6px 0;padding:0">Ride started</h1>'
+                f'<p style="font-size:14px;color:#64748b">Heading to {hosp}. Opening route selection…</p></div>', unsafe_allow_html=True)
+
+
+def booking():
+    b = S.book
+    stage = b["stage"] if b else "details"
+    _, mid, _ = st.columns([1, 3, 1])
+    with mid:
+        st.markdown(stepper({"details": 0, "assigned": 1, "otp": 2, "started": 3}[stage]), unsafe_allow_html=True)
+        if stage == "details":
+            q = quote()
+            code, name = q["type"].split(" (")[1][:-1], q["type"].split(" (")[0]
+            st.markdown(f'<div class="card"><div class="row sp" style="align-items:flex-start"><div class="row"><div class="ico bs">{hsvg(19)}</div><div>'
+                        f'<p class="eyebrow">Destination</p><div class="ttl">{hosp}</div><div class="mut">{HOSPITALS[hosp]["area"]} · pickup: {start_label}</div></div></div>'
+                        f'{pill(f"{q["avail"]} ambulances available")}</div>'
+                        f'<div style="margin-top:16px">{mets([(code, name, False), (f"{q["pickup"]} min", "Ambulance arrival", True), (f"{q["journey"]} min", "Journey time", False), (f"₹{q["cost"]:,}", "Booking cost (demo)", False)])}</div>'
+                        f'<div class="foot">Illustrative demo data. No payment is taken.</div></div>', unsafe_allow_html=True)
+            if st.button("Book Ambulance", type="primary", width="stretch", key="book_now"):
+                r = random.Random()
+                S.book = dict(stage="assigned", id=f"AMB-{r.randint(100000, 999999)}", otp=f"{r.randint(0, 9999):04d}", t0=dt.datetime.now(), err=False,
+                              reg=f"WB {r.randint(10, 99)} {r.choice('ABCDEFGH')}{r.choice('ABCDEFGH')} {r.randint(1000, 9999)}",
+                              driver=r.choice(["Ramesh Das", "Sourav Ghosh", "Imran Sheikh", "Anil Mondal"]), phone=f"98{r.randint(30000000, 99999999)}", **q)
+                st.rerun()
+            st.button("← Back to hospitals", key="back_h2", on_click=goto, args=("hospitals",))
+        elif stage == "assigned":
+            st.markdown(ambulance_card(b, "Ambulance on the way"), unsafe_allow_html=True)
+            tracking()
+        elif stage == "otp":
+            st.markdown('<div class="alert al-blue"><h3>Ambulance has arrived</h3><p>Share the code below with the driver to start your ride.</p></div>', unsafe_allow_html=True)
+            st.markdown(ambulance_card(b, "Arrived"), unsafe_allow_html=True)
+            st.markdown(f'<div class="card" style="text-align:center"><p class="eyebrow">Your ride OTP (simulated)</p><div class="otp">{b["otp"]}</div></div>', unsafe_allow_html=True)
+            with st.form("otp_form", border=False):
+                code = st.text_input("Enter 4-digit OTP", max_chars=4, placeholder="••••")
+                if st.form_submit_button("Verify OTP", type="primary", width="stretch"):
+                    if code.strip() == b["otp"]:
+                        b["stage"], b["t1"] = "started", dt.datetime.now()
+                        st.rerun()
+                    b["err"] = True
+            if b["err"]:
+                st.error("Incorrect OTP. Please try again.")
+        else:
+            ride_started()
+
+
 # ----------------------------------------------------------------------------- navigation (automatic simulation)
 def tick(nav):
     """Advance the simulation one step. Returns True once the hospital is reached."""
@@ -588,7 +679,7 @@ def tick(nav):
             nav["result"] = dict(total=total, final=(round(sn["elapsed"] + sn["alt"][0]), round(sn["elapsed"] + sn["alt"][1])),
                                  arrived=dt.datetime.now())
             e = nav["eta"]
-            S.history.insert(0, dict(date=dt.datetime.now().strftime("Today, %H:%M"), hospital=nav["hosp"], route="Rerouted · avoided accident",
+            S.history.insert(0, dict(date=dt.datetime.now().strftime("Today, %H:%M"), hospital=nav["hosp"], route="Rerouted · avoided busy road",
                                      dist=f"{nav['info']['cum'][-1]:.1f} km", time=f"{total} min", est=rng(e["lo"], e["hi"]),
                                      ok=e["lo"] <= total <= e["hi"]))
             S.phase, S.screen = "arrived", "arrival"
@@ -636,7 +727,7 @@ def nav_cards(nav, info, on_alt, rem, dist):
     # --- instruction card (+ reroute confirmation)
     with st.container(key="nav_instr"):
         if ph == "incident_detected":
-            ic, t, s = "stop", "Reducing speed", "Incident ahead on your route"
+            ic, t, s = "stop", "Reducing speed", "Road ahead looks too busy"
         elif ph == "rerouting":
             ic, t, s = "calc", "Calculating a new route", "Stay on the current road"
         else:
@@ -648,7 +739,7 @@ def nav_cards(nav, info, on_alt, rem, dist):
                         f'<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">'
                         f'<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h3a3 3 0 0 0 3-3v-1a3 3 0 0 0-3-3h2a3 3 0 0 0 3-3V7"/></svg></div>'
                         f'<div>{pill("Safer route found")}<div class="ttl" style="margin-top:6px;font-size:15px">Navigation updated automatically</div>'
-                        f'<div style="font-size:12px;color:#64748b;margin-top:3px;line-height:1.5">An accident is affecting the original route. A route with a '
+                        f'<div style="font-size:12px;color:#64748b;margin-top:3px;line-height:1.5">The original route looks too busy. A route with a '
                         f'lower worst-case ETA has been selected.</div></div></div>'
                         f'<div class="row sp" style="background:#ecfdf5;border-radius:12px;padding:10px 14px;margin-top:12px"><div><small style="color:#047857;font-size:10px">'
                         f'Updated ETA</small><div style="font-weight:700;color:#065f46">{rng(*rem)}</div></div><div style="text-align:right"><small style="color:#047857;font-size:10px">'
@@ -664,9 +755,9 @@ def nav_cards(nav, info, on_alt, rem, dist):
             if ph == "incident_detected":
                 st.markdown(f'<div class="float" style="border:1px solid #fecaca"><div class="row" style="align-items:flex-start;gap:14px">'
                             f'<div class="ico r" style="width:48px;height:48px;border-radius:16px;font-size:22px">⚠</div><div style="flex:1">'
-                            f'<div class="row sp">{pill("Incident ahead", "amber")}<span class="mut">Just now</span></div>'
-                            f'<div class="ttl xl" style="margin-top:10px">Road Incident Detected</div>'
-                            f'<p style="font-size:13px;line-height:1.7;color:#64748b;margin:6px 0 0">An accident has been reported ahead on your current route. '
+                            f'<div class="row sp">{pill("Heavy traffic ahead", "amber")}<span class="mut">Just now</span></div>'
+                            f'<div class="ttl xl" style="margin-top:10px">Road looks too busy</div>'
+                            f'<p style="font-size:13px;line-height:1.7;color:#64748b;margin:6px 0 0">The road ahead on your current route looks too busy. '
                             f'Travel time on the affected road segment has increased.</p></div></div>'
                             f'<div class="two"><div style="background:#fef2f2"><small style="color:#ef4444">Previous ETA</small><b style="color:#b91c1c">{rng(*sn["prev"])}</b></div>'
                             f'<div style="background:#fff7ed"><small style="color:#c2410c">Updated ETA</small><b style="color:#c2410c">{rng(*sn["upd"])}</b></div></div></div>',
@@ -685,7 +776,7 @@ def nav_cards(nav, info, on_alt, rem, dist):
     with st.container(key="nav_bottom"):
         prog = info["cum"][S.idx] / info["cum"][-1]
         mid = round((rem[0] + rem[1]) / 2)
-        status = {"navigating_initial": ("Navigating · " + kind, "blue"), "incident_detected": ("Incident detected", "red"),
+        status = {"navigating_initial": ("Navigating · " + kind, "blue"), "incident_detected": ("Road looks too busy", "red"),
                   "rerouting": ("Re-routing", "amber"), "navigating_alternative": ("Following alternative route", "green")}[ph]
         conf = "Low confidence" if nav["wide"] > 1 else "High confidence"
         st.markdown(f'<div class="float"><div class="row sp"><div class="row"><div class="ico r" style="width:48px;height:48px;border-radius:12px">{hsvg(22)}</div>'
@@ -717,7 +808,6 @@ def arrival():
                 f'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg></div>'
                 f'<p class="eyebrow" style="color:#059669;margin-top:26px">Journey complete</p><h1 style="font-size:2.6rem;font-weight:600;margin:6px 0;padding:0">'
                 f'You’ve arrived safely</h1><p style="font-size:14px;color:#64748b">{nav["hosp"]} · Emergency entrance</p></div>', unsafe_allow_html=True)
-    st.balloons()
     l, r = st.columns([5, 6], gap="medium")
     with l:
         with st.container(key="panel_sum"):
@@ -729,11 +819,11 @@ def arrival():
                         f'<div class="sum"><b>{rng(e["lo"], e["hi"]).replace(" min", "")}</b><small>Original ETA (min)</small></div>'
                         f'<div class="sum"><b>{rng(*res["final"]).replace(" min", "")}</b><small>Final ETA (min)</small></div></div>'
                         f'<div class="tl" style="margin-top:14px"><div><b>Navigation started</b><br><small>{"Fastest" if nav["kind"] == "fast" else "Most reliable"} route · ETA {rng(e["lo"], e["hi"])}</small></div>'
-                        f'<div class="r"><b>Incident encountered</b><br><small>Road accident ahead · ETA rose to {rng(*sn["upd"])}</small></div>'
+                        f'<div class="r"><b>Busy road encountered</b><br><small>Road looks too busy · ETA rose to {rng(*sn["upd"])}</small></div>'
                         f'<div class="g"><b>Automatic reroute</b><br><small>Lower worst-case ETA ({sn["alt"][1]} min vs {sn["upd"][1]} min) selected</small></div>'
                         f'<div class="g"><b>Arrived at {nav["hosp"]}</b><br><small>Route followed: original route → alternative safer route</small></div></div>'
                         f'<div class="card" style="background:#f8fafc;margin:8px 0 0"><div class="row"><div class="ico g" style="border-radius:50%;width:36px;height:36px">{SHIELD}</div>'
-                        f'<div><div style="font-size:12px;font-weight:700">Why we rerouted</div><div class="mut">An accident was affecting the original route. An alternative route '
+                        f'<div><div style="font-size:12px;font-weight:700">Why we rerouted</div><div class="mut">The original route looked too busy. An alternative route '
                         f'with a lower worst-case ETA was selected automatically.</div></div></div></div>', unsafe_allow_html=True)
         b1, b2 = st.columns(2)
         b1.button("Return to overview", type="primary", width="stretch", on_click=goto, args=("overview",))
@@ -822,6 +912,7 @@ def planner():
                         f'<span>Departure</span><span>ETA range</span><span>Expected</span></div>{body}', unsafe_allow_html=True)
         if st.button("Confirm and Start Trip  →", type="primary", key="confirm_trip"):
             S.hosp, S.hosp_manual, S.route = p["dest"], True, "rel"
+            S.book = dict(stage="started")  # non-urgent trip: no ambulance needed
             S.screen = "compare"
             st.rerun()
 
@@ -848,5 +939,7 @@ def history():
 
 
 # ----------------------------------------------------------------------------- router
-{"overview": overview, "hospitals": hospitals, "compare": compare, "navigation": navigation, "arrival": arrival,
+if S.screen in ("compare", "navigation") and (S.book or {}).get("stage") != "started":
+    S.screen = "booking"  # guard: navigation requires a verified ambulance ride
+{"overview": overview, "booking": booking, "hospitals": hospitals, "compare": compare, "navigation": navigation, "arrival": arrival,
  "planner": planner, "history": history}[S.screen]()
